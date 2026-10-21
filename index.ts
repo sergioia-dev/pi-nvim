@@ -280,42 +280,59 @@ export default function (pi: ExtensionAPI) {
       conn.on("error", () => {});
     });
 
-    server.listen(socketPath, () => {
-      // Only the owner may talk to this socket.
-      try {
-        if (socketPath) fs.chmodSync(socketPath, 0o600);
-      } catch {}
+    // Wait for the listen callback before announcing the session: a client can
+    // connect as soon as it sees the manifest, so session_start must not
+    // resolve while the socket is still not accepting connections.
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const onListenError = (err: Error) => reject(err);
+        server!.once("error", onListenError);
+        server!.listen(socketPath!, () => {
+          server!.off("error", onListenError);
+          resolve();
+        });
+      });
+    } catch (err: any) {
+      ctx.ui.notify(`pi-nvim: cannot listen on ${socketPath}, ${err?.message ?? err}`, "error");
+      server = null;
+      return;
+    }
 
-      // Update latest symlink (unix only)
-      if (LATEST_LINK && socketPath) {
-        unlinkQuietly(LATEST_LINK);
-        try {
-          fs.symlinkSync(socketPath, LATEST_LINK);
-        } catch {}
-      }
-
-      // Register in sockets directory for discovery
-      try {
-        // Windows: named pipes aren't visible in the filesystem, so leave a
-        // marker file the nvim side can stat for liveness.
-        if (IS_WIN && markerFile) fs.writeFileSync(markerFile, "");
-        if (markerFile) {
-          fs.writeFileSync(
-            markerFile + ".info",
-            JSON.stringify({
-              socket: socketPath,
-              cwd,
-              pid: process.pid,
-              startedAt: new Date().toISOString(),
-            }),
-          );
-        }
-      } catch {}
-    });
-
+    // Errors after a successful listen are reported, but must not crash pi.
     server.on("error", (err) => {
       ctx.ui.notify(`pi-nvim error: ${err.message}`, "error");
     });
+
+    // Only the owner may talk to this socket.
+    try {
+      if (socketPath) fs.chmodSync(socketPath, 0o600);
+    } catch {}
+
+    // Update latest symlink (unix only)
+    if (LATEST_LINK && socketPath) {
+      unlinkQuietly(LATEST_LINK);
+      try {
+        fs.symlinkSync(socketPath, LATEST_LINK);
+      } catch {}
+    }
+
+    // Register in sockets directory for discovery
+    try {
+      // Windows: named pipes aren't visible in the filesystem, so leave a
+      // marker file the nvim side can stat for liveness.
+      if (IS_WIN && markerFile) fs.writeFileSync(markerFile, "");
+      if (markerFile) {
+        fs.writeFileSync(
+          markerFile + ".info",
+          JSON.stringify({
+            socket: socketPath,
+            cwd,
+            pid: process.pid,
+            startedAt: new Date().toISOString(),
+          }),
+        );
+      }
+    } catch {}
   });
 
   function handleMessage(raw: string, conn: net.Socket) {
