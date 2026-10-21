@@ -45,6 +45,15 @@ local function trim(s)
   return (s:gsub("^%s+", ""):gsub("%s+$", ""))
 end
 
+--- Use the raw `:cmd` argument as a prompt (nil when empty). `args.args`
+--- keeps the text exactly as typed, unlike the split `fargs`.
+local function text_from_args(args)
+  if not args then return nil end
+  local text = trim(args.args or "")
+  if text == "" then return nil end
+  return text
+end
+
 --- Directory holding the .info manifests / marker files. Must match the
 --- pi extension's SOCKETS_DIR: /tmp on unix, %TEMP% on Windows.
 local function sockets_dir()
@@ -189,9 +198,11 @@ function M.setup(opts)
   end
 
   -- Commands
-  vim.api.nvim_create_user_command("PiSend", function()
-    M.prompt()
-  end, { force = true, desc = "Send a prompt to pi" })
+  vim.api.nvim_create_user_command("PiSend", function(args)
+    -- `:PiSend /skill:foo` sends the text straight away; no args opens the
+    -- prompt. Without nargs, any argument would raise E488.
+    M.prompt(text_from_args(args))
+  end, { force = true, nargs = "*", desc = "Send a prompt to pi" })
 
   vim.api.nvim_create_user_command("PiSendFile", function()
     M.send_file()
@@ -206,13 +217,21 @@ function M.setup(opts)
   end, { force = true, desc = "Send entire buffer to pi with a prompt" })
 
   vim.api.nvim_create_user_command("Pi", function(args)
+    -- `:Pi /settings` (or any text) sends it directly, so a slash command
+    -- typed on the command line is routed instead of raising E488.
+    local text = text_from_args(args)
+    if text then
+      M.prompt(text)
+      return
+    end
+
     local ui = require("pi-nvim.ui")
     local selection = nil
     if args.range == 2 then
       selection = ui.capture_selection()
     end
     ui.open({ selection = selection })
-  end, { force = true, range = true, desc = "Open pi send dialog" })
+  end, { force = true, nargs = "*", range = true, desc = "Open pi send dialog, or send the given text" })
 
   vim.api.nvim_create_user_command("PiPing", function()
     M.ping()
