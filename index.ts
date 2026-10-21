@@ -16,6 +16,7 @@ import * as crypto from "node:crypto";
  * Commands:
  *   { "type": "prompt", "message": "..." }
  *   { "type": "prompt", "message": "...", "images": [...] }
+ *   { "type": "prompt", "message": "/skill:foo", "expandPromptTemplates": true }
  *   { "type": "ping" }
  *
  * Responses:
@@ -41,6 +42,23 @@ const SOCKETS_DIR = IS_WIN ? path.join(os.tmpdir(), "pi-nvim-sockets") : "/tmp/p
 // Windows has no symlinks here; discovery relies solely on the .info manifests.
 const LATEST_LINK = IS_WIN ? null : "/tmp/pi-nvim-latest.sock";
 
+
+interface ImageContent {
+  type: "image";
+  data: string;
+  mimeType: string;
+}
+
+function isImageContent(value: unknown): value is ImageContent {
+  const candidate = value as Partial<ImageContent> | null;
+  return (
+    typeof candidate === "object" &&
+    candidate !== null &&
+    candidate.type === "image" &&
+    typeof candidate.data === "string" &&
+    typeof candidate.mimeType === "string"
+  );
+}
 function socketBase(cwd: string): string {
   return `${cwdHash(cwd)}-${process.pid}`;
 }
@@ -139,8 +157,24 @@ export default function (pi: ExtensionAPI) {
       if (msg.type === "prompt" && typeof msg.message === "string") {
         // Exit kitty's scrollback viewer by switching to private screen mode
         // and back. This snaps to the bottom without clearing scrollback history.
-        process.stdout.write("\x1b[?1049h\x1b[?1049l");
-        pi.sendUserMessage(msg.message, { deliverAs: "followUp" });
+        if (process.stdout.isTTY) {
+          process.stdout.write("\x1b[?1049h\x1b[?1049l");
+        }
+
+        const images: ImageContent[] = Array.isArray(msg.images)
+          ? msg.images.filter(isImageContent)
+          : [];
+        pi.sendUserMessage(
+          images.length > 0
+            ? [{ type: "text" as const, text: msg.message }, ...images]
+            : msg.message,
+          {
+            deliverAs: "followUp",
+            // Without this the text goes to the model as-is, so extension
+            // commands and /skill:* are never dispatched or expanded.
+            expandPromptTemplates: msg.expandPromptTemplates === true,
+          },
+        );
         respond(conn, { ok: true });
         return;
       }
