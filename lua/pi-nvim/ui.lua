@@ -140,7 +140,12 @@ function M.open(opts)
   if selection and vim.api.nvim_buf_is_valid(source_buf) then
     sel_ns = vim.api.nvim_create_namespace("pi_nvim_selection")
     for lnum = selection.start_line, selection.end_line do
-      vim.api.nvim_buf_add_highlight(source_buf, sel_ns, "Visual", lnum - 1, 0, -1)
+      -- vim.hl.range (nvim 0.11+) replaces the deprecated nvim_buf_add_highlight.
+      if vim.hl and vim.hl.range then
+        vim.hl.range(source_buf, sel_ns, "Visual", { lnum - 1, 0 }, { lnum - 1, -1 })
+      else
+        vim.api.nvim_buf_add_highlight(source_buf, sel_ns, "Visual", lnum - 1, 0, -1)
+      end
     end
   end
 
