@@ -73,33 +73,189 @@ function getSocketPath(cwd: string): string {
   return IS_WIN ? `\\\\.\\pipe\\pi-nvim-${socketBase(cwd)}` : socketFilePath(cwd);
 }
 
+/** Longest unterminated line we buffer before dropping the connection. */
+const MAX_LINE_BYTES = 1024 * 1024;
+/** Connections served at the same time. */
+const MAX_CONNECTIONS = 32;
+/** A client that sends nothing for this long is disconnected. */
+const IDLE_TIMEOUT_MS = 30_000;
+/** Manifests older than this are abandoned, whatever their pid says. */
+const STALE_AFTER_MS = 7 * 24 * 60 * 60 * 1000;
+
+const MANIFEST_SUFFIX = ".info";
+
+interface Manifest {
+  socket?: string;
+  cwd?: string;
+  pid?: number;
+  startedAt?: string;
+}
+
+function unlinkQuietly(target: string): void {
+  try {
+    fs.unlinkSync(target);
+  } catch {}
+}
+
+function removeLatestLinkTo(target: string): void {
+  if (!LATEST_LINK) return;
+  try {
+    if (fs.readlinkSync(LATEST_LINK) === target) unlinkQuietly(LATEST_LINK);
+  } catch {}
+}
+
+function readManifest(infoPath: string): Manifest | null {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(infoPath, "utf8"));
+    return parsed && typeof parsed === "object" ? (parsed as Manifest) : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Does this pid still exist? EPERM means "yes, but not ours". */
+function isPidAlive(pid: unknown): boolean {
+  if (typeof pid !== "number" || !Number.isFinite(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e: any) {
+    return e?.code === "EPERM";
+  }
+}
+
+/**
+ * Remove manifests and sockets left behind by pi sessions that are gone
+ * (killed, crashed, or long dead). Without this every dead session keeps
+ * shadowing live ones during discovery.
+ */
+function pruneStaleSockets(): void {
+  let entries: string[];
+  try {
+    entries = fs.readdirSync(SOCKETS_DIR);
+  } catch {
+    return;
+  }
+
+  const now = Date.now();
+  for (const entry of entries) {
+    if (!entry.endsWith(MANIFEST_SUFFIX)) continue;
+    const infoPath = path.join(SOCKETS_DIR, entry);
+    // "<base>.sock.info" → "<base>.sock" (unix socket, or Windows marker file)
+    const socketFile = infoPath.slice(0, -MANIFEST_SUFFIX.length);
+    const info = readManifest(infoPath);
+
+    const startedAt = info?.startedAt ? Date.parse(info.startedAt) : NaN;
+    const unreadable = info === null;
+    const deadPid = typeof info?.pid === "number" && !isPidAlive(info.pid);
+    const tooOld = Number.isFinite(startedAt) && now - startedAt > STALE_AFTER_MS;
+    const orphaned = info !== null && !fs.existsSync(socketFile);
+
+    if (!unreadable && !deadPid && !tooOld && !orphaned) continue;
+
+    unlinkQuietly(infoPath);
+    unlinkQuietly(socketFile);
+    removeLatestLinkTo(socketFile);
+  }
+}
+
+/**
+ * Create the sockets directory and refuse to serve if it is not ours: another
+ * user owning it could pre-create the socket paths we are about to bind.
+ */
+function ensureSocketsDir(): { ok: true } | { ok: false; reason: string } {
+  try {
+    fs.mkdirSync(SOCKETS_DIR, { recursive: true, mode: 0o700 });
+  } catch (e: any) {
+    return { ok: false, reason: `cannot create ${SOCKETS_DIR}: ${e?.message ?? e}` };
+  }
+
+  try {
+    const stat = fs.statSync(SOCKETS_DIR);
+    const uid = typeof process.getuid === "function" ? process.getuid() : null;
+    if (uid !== null && stat.uid !== uid) {
+      return { ok: false, reason: `${SOCKETS_DIR} is owned by uid ${stat.uid}, not ${uid}` };
+    }
+    fs.chmodSync(SOCKETS_DIR, 0o700);
+  } catch (e: any) {
+    return { ok: false, reason: `cannot inspect ${SOCKETS_DIR}: ${e?.message ?? e}` };
+  }
+
+  return { ok: true };
+}
+
+const EXIT_HANDLERS_KEY = Symbol.for("pi-nvim.exit-handlers");
+
+/**
+ * Run `fn` on process exit. The `exit` listener is installed once per process:
+ * pi reloads extensions on /reload, and a module-level `process.on("exit", …)`
+ * would pile up a listener (and a socket) per reload.
+ */
+function registerExitHandler(fn: () => void): void {
+  const store = globalThis as unknown as Record<symbol, Set<() => void> | undefined>;
+  let handlers = store[EXIT_HANDLERS_KEY];
+  if (!handlers) {
+    handlers = new Set<() => void>();
+    store[EXIT_HANDLERS_KEY] = handlers;
+    process.once("exit", () => {
+      for (const handler of handlers ?? []) {
+        try {
+          handler();
+        } catch {}
+      }
+    });
+  }
+  handlers.add(fn);
+}
+
+function unregisterExitHandler(fn: () => void): void {
+  const store = globalThis as unknown as Record<symbol, Set<() => void> | undefined>;
+  store[EXIT_HANDLERS_KEY]?.delete(fn);
+}
+
 export default function (pi: ExtensionAPI) {
   let server: net.Server | null = null;
   let socketPath: string | null = null;
   let markerFile: string | null = null;
+  let connections = 0;
 
   pi.on("session_start", async (_event, ctx) => {
     const cwd = ctx.cwd;
-    // Ensure sockets directory exists
-    try {
-      fs.mkdirSync(SOCKETS_DIR, { recursive: true });
-    } catch {}
+    // Ensure the sockets directory exists and belongs to us
+    const dir = ensureSocketsDir();
+    if (!dir.ok) {
+      ctx.ui.notify(`pi-nvim: refusing to open a socket, ${dir.reason}`, "error");
+      return;
+    }
+
+    pruneStaleSockets();
 
     socketPath = getSocketPath(cwd);
     markerFile = socketFilePath(cwd);
 
     // Clean up stale socket/marker
-    try {
-      fs.unlinkSync(socketPath);
-    } catch {}
-    try {
-      fs.unlinkSync(markerFile);
-    } catch {}
+    unlinkQuietly(socketPath);
+    unlinkQuietly(markerFile);
 
     server = net.createServer((conn) => {
+      if (connections >= MAX_CONNECTIONS) {
+        conn.destroy();
+        return;
+      }
+      connections += 1;
+
+      // A client that connects and then goes silent must not hold a slot.
+      conn.setTimeout(IDLE_TIMEOUT_MS, () => conn.destroy());
+
       let buffer = "";
       conn.on("data", (data) => {
         buffer += data.toString();
+        if (buffer.length > MAX_LINE_BYTES) {
+          // Never buffer an unbounded line: drop the client instead.
+          buffer = "";
+          conn.destroy();
+          return;
+        }
         let newlineIdx: number;
         while ((newlineIdx = buffer.indexOf("\n")) !== -1) {
           const line = buffer.slice(0, newlineIdx).trim();
@@ -108,10 +264,17 @@ export default function (pi: ExtensionAPI) {
           handleMessage(line, conn, cwd);
         }
       });
+      conn.on("close", () => {
+        connections = Math.max(0, connections - 1);
+      });
       conn.on("error", () => {});
     });
 
     server.listen(socketPath, () => {
+      // Only the owner may talk to this socket.
+      try {
+        fs.chmodSync(socketPath!, 0o600);
+      } catch {}
       // Update latest symlink (unix only)
       if (LATEST_LINK) {
         try {
@@ -215,12 +378,14 @@ export default function (pi: ExtensionAPI) {
     } catch {}
   }
 
+  const exitCleanup = () => cleanup();
+  registerExitHandler(exitCleanup);
+
   pi.on("session_shutdown", async () => {
+    // session_shutdown is the reliable path; the exit handler is a backstop.
+    unregisterExitHandler(exitCleanup);
     cleanup();
   });
-
-  // Also clean up on process exit
-  process.on("exit", cleanup);
 
   pi.registerCommand("pi-nvim-info", {
     description: "Show pi-nvim socket path",
