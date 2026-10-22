@@ -15,9 +15,14 @@ import * as crypto from "node:crypto";
  *
  * Commands:
  *   { "type": "prompt", "message": "..." }
- *   { "type": "prompt", "message": "...", "images": [...] }
+ *   { "type": "prompt", "message": "...", "images": [{ "type": "image", "data": "<base64>", "mimeType": "image/png" }] }
  *   { "type": "prompt", "message": "/skill:foo", "expandPromptTemplates": true }
  *   { "type": "ping" }
+ *
+ * expandPromptTemplates makes pi dispatch extension commands and expand
+ * /skill:* and /template instead of sending the text to the model. pi's
+ * built-in TUI commands (/settings, /model, …) cannot be dispatched this way:
+ * the Neovim side types those into the pi terminal instead.
  *
  * Responses:
  *   { "ok": true }
@@ -38,40 +43,13 @@ function cwdHash(cwd: string): string {
 }
 
 const IS_WIN = process.platform === "win32";
-const SOCKETS_DIR = IS_WIN ? path.join(os.tmpdir(), "pi-nvim-sockets") : "/tmp/pi-nvim-sockets";
+// PI_NVIM_SOCKETS_DIR lets callers (tests, unusual setups) move the directory;
+// the neovim plugin reads the same variable.
+const SOCKETS_DIR =
+  process.env.PI_NVIM_SOCKETS_DIR ||
+  (IS_WIN ? path.join(os.tmpdir(), "pi-nvim-sockets") : "/tmp/pi-nvim-sockets");
 // Windows has no symlinks here; discovery relies solely on the .info manifests.
 const LATEST_LINK = IS_WIN ? null : "/tmp/pi-nvim-latest.sock";
-
-
-interface ImageContent {
-  type: "image";
-  data: string;
-  mimeType: string;
-}
-
-function isImageContent(value: unknown): value is ImageContent {
-  const candidate = value as Partial<ImageContent> | null;
-  return (
-    typeof candidate === "object" &&
-    candidate !== null &&
-    candidate.type === "image" &&
-    typeof candidate.data === "string" &&
-    typeof candidate.mimeType === "string"
-  );
-}
-function socketBase(cwd: string): string {
-  return `${cwdHash(cwd)}-${process.pid}`;
-}
-
-/** Path of the socket file (unix) or the liveness marker file (Windows). */
-function socketFilePath(cwd: string): string {
-  return path.join(SOCKETS_DIR, `${socketBase(cwd)}.sock`);
-}
-
-/** Actual listen address: a unix socket path or a Windows named pipe. */
-function getSocketPath(cwd: string): string {
-  return IS_WIN ? `\\\\.\\pipe\\pi-nvim-${socketBase(cwd)}` : socketFilePath(cwd);
-}
 
 /** Longest unterminated line we buffer before dropping the connection. */
 const MAX_LINE_BYTES = 1024 * 1024;
@@ -89,6 +67,26 @@ interface Manifest {
   cwd?: string;
   pid?: number;
   startedAt?: string;
+}
+
+interface ImageContent {
+  type: "image";
+  data: string;
+  mimeType: string;
+}
+
+function socketBase(cwd: string): string {
+  return `${cwdHash(cwd)}-${process.pid}`;
+}
+
+/** Path of the socket file (unix) or the liveness marker file (Windows). */
+function socketFilePath(cwd: string): string {
+  return path.join(SOCKETS_DIR, `${socketBase(cwd)}.sock`);
+}
+
+/** Actual listen address: a unix socket path or a Windows named pipe. */
+function getSocketPath(cwd: string): string {
+  return IS_WIN ? `\\\\.\\pipe\\pi-nvim-${socketBase(cwd)}` : socketFilePath(cwd);
 }
 
 function unlinkQuietly(target: string): void {
@@ -188,8 +186,8 @@ const EXIT_HANDLERS_KEY = Symbol.for("pi-nvim.exit-handlers");
 
 /**
  * Run `fn` on process exit. The `exit` listener is installed once per process:
- * pi reloads extensions on /reload, and a module-level `process.on("exit", …)`
- * would pile up a listener (and a socket) per reload.
+ * pi reloads extensions on /reload, and `process.on("exit", …)` in the module
+ * body would pile up a listener (and a socket) per reload.
  */
 function registerExitHandler(fn: () => void): void {
   const store = globalThis as unknown as Record<symbol, Set<() => void> | undefined>;
@@ -213,6 +211,17 @@ function unregisterExitHandler(fn: () => void): void {
   store[EXIT_HANDLERS_KEY]?.delete(fn);
 }
 
+function isImageContent(value: unknown): value is ImageContent {
+  const candidate = value as Partial<ImageContent> | null;
+  return (
+    typeof candidate === "object" &&
+    candidate !== null &&
+    candidate.type === "image" &&
+    typeof candidate.data === "string" &&
+    typeof candidate.mimeType === "string"
+  );
+}
+
 export default function (pi: ExtensionAPI) {
   let server: net.Server | null = null;
   let socketPath: string | null = null;
@@ -221,7 +230,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, ctx) => {
     const cwd = ctx.cwd;
-    // Ensure the sockets directory exists and belongs to us
+
     const dir = ensureSocketsDir();
     if (!dir.ok) {
       ctx.ui.notify(`pi-nvim: refusing to open a socket, ${dir.reason}`, "error");
@@ -233,7 +242,7 @@ export default function (pi: ExtensionAPI) {
     socketPath = getSocketPath(cwd);
     markerFile = socketFilePath(cwd);
 
-    // Clean up stale socket/marker
+    // Clean up stale socket/marker from a previous session in this cwd
     unlinkQuietly(socketPath);
     unlinkQuietly(markerFile);
 
@@ -261,38 +270,60 @@ export default function (pi: ExtensionAPI) {
           const line = buffer.slice(0, newlineIdx).trim();
           buffer = buffer.slice(newlineIdx + 1);
           if (!line) continue;
-          handleMessage(line, conn, cwd);
+          handleMessage(line, conn);
         }
       });
+
       conn.on("close", () => {
         connections = Math.max(0, connections - 1);
       });
       conn.on("error", () => {});
     });
 
-    server.listen(socketPath, () => {
-      // Only the owner may talk to this socket.
-      try {
-        fs.chmodSync(socketPath!, 0o600);
-      } catch {}
-      // Update latest symlink (unix only)
-      if (LATEST_LINK) {
-        try {
-          fs.unlinkSync(LATEST_LINK);
-        } catch {}
-        try {
-          fs.symlinkSync(socketPath!, LATEST_LINK);
-        } catch {}
-      }
+    // Wait for the listen callback before announcing the session: a client can
+    // connect as soon as it sees the manifest, so session_start must not
+    // resolve while the socket is still not accepting connections.
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const onListenError = (err: Error) => reject(err);
+        server!.once("error", onListenError);
+        server!.listen(socketPath!, () => {
+          server!.off("error", onListenError);
+          resolve();
+        });
+      });
+    } catch (err: any) {
+      ctx.ui.notify(`pi-nvim: cannot listen on ${socketPath}, ${err?.message ?? err}`, "error");
+      server = null;
+      return;
+    }
 
-      // Register in sockets directory for discovery
+    // Errors after a successful listen are reported, but must not crash pi.
+    server.on("error", (err) => {
+      ctx.ui.notify(`pi-nvim error: ${err.message}`, "error");
+    });
+
+    // Only the owner may talk to this socket.
+    try {
+      if (socketPath) fs.chmodSync(socketPath, 0o600);
+    } catch {}
+
+    // Update latest symlink (unix only)
+    if (LATEST_LINK && socketPath) {
+      unlinkQuietly(LATEST_LINK);
       try {
-        fs.mkdirSync(SOCKETS_DIR, { recursive: true });
-        // Windows: named pipes aren't visible in the filesystem, so leave a
-        // marker file the nvim side can stat for liveness.
-        if (IS_WIN) fs.writeFileSync(markerFile!, "");
+        fs.symlinkSync(socketPath, LATEST_LINK);
+      } catch {}
+    }
+
+    // Register in sockets directory for discovery
+    try {
+      // Windows: named pipes aren't visible in the filesystem, so leave a
+      // marker file the nvim side can stat for liveness.
+      if (IS_WIN && markerFile) fs.writeFileSync(markerFile, "");
+      if (markerFile) {
         fs.writeFileSync(
-          markerFile! + ".info",
+          markerFile + ".info",
           JSON.stringify({
             socket: socketPath,
             cwd,
@@ -300,15 +331,11 @@ export default function (pi: ExtensionAPI) {
             startedAt: new Date().toISOString(),
           }),
         );
-      } catch {}
-    });
-
-    server.on("error", (err) => {
-      ctx.ui.notify(`pi-nvim error: ${err.message}`, "error");
-    });
+      }
+    } catch {}
   });
 
-  function handleMessage(raw: string, conn: net.Socket, _cwd: string) {
+  function handleMessage(raw: string, conn: net.Socket) {
     try {
       const msg = JSON.parse(raw);
 
@@ -320,6 +347,7 @@ export default function (pi: ExtensionAPI) {
       if (msg.type === "prompt" && typeof msg.message === "string") {
         // Exit kitty's scrollback viewer by switching to private screen mode
         // and back. This snaps to the bottom without clearing scrollback history.
+        // Only meaningful when stdout is a terminal we can drive.
         if (process.stdout.isTTY) {
           process.stdout.write("\x1b[?1049h\x1b[?1049l");
         }
@@ -327,17 +355,15 @@ export default function (pi: ExtensionAPI) {
         const images: ImageContent[] = Array.isArray(msg.images)
           ? msg.images.filter(isImageContent)
           : [];
-        pi.sendUserMessage(
+        const content =
           images.length > 0
             ? [{ type: "text" as const, text: msg.message }, ...images]
-            : msg.message,
-          {
-            deliverAs: "followUp",
-            // Without this the text goes to the model as-is, so extension
-            // commands and /skill:* are never dispatched or expanded.
-            expandPromptTemplates: msg.expandPromptTemplates === true,
-          },
-        );
+            : msg.message;
+
+        pi.sendUserMessage(content, {
+          deliverAs: "followUp",
+          expandPromptTemplates: msg.expandPromptTemplates === true,
+        });
         respond(conn, { ok: true });
         return;
       }
@@ -360,29 +386,19 @@ export default function (pi: ExtensionAPI) {
       server = null;
     }
     if (!socketPath) return;
-    try {
-      fs.unlinkSync(socketPath);
-    } catch {}
-    try {
-      if (markerFile) fs.unlinkSync(markerFile);
-    } catch {}
-    try {
-      // Clean up latest symlink if it points to us (unix only)
-      if (LATEST_LINK) {
-        const target = fs.readlinkSync(LATEST_LINK);
-        if (target === socketPath) fs.unlinkSync(LATEST_LINK);
-      }
-    } catch {}
-    try {
-      if (markerFile) fs.unlinkSync(markerFile + ".info");
-    } catch {}
+    unlinkQuietly(socketPath);
+    removeLatestLinkTo(socketPath);
+    if (markerFile) {
+      unlinkQuietly(markerFile);
+      unlinkQuietly(markerFile + ".info");
+    }
   }
 
   const exitCleanup = () => cleanup();
   registerExitHandler(exitCleanup);
 
   pi.on("session_shutdown", async () => {
-    // session_shutdown is the reliable path; the exit handler is a backstop.
+    // session_shutdown is the reliable path; the exit handler is only a backstop.
     unregisterExitHandler(exitCleanup);
     cleanup();
   });
