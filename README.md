@@ -2,6 +2,12 @@
 
 Bridge between [pi](https://github.com/badlogic/pi) coding agent and Neovim. Run pi in one terminal pane and Neovim in another — send files, selections, and prompts from Neovim directly into your running pi session.
 
+> **Fork notice** — this checkout is published as `@sergioia-dev/pi-nvim`, a fork of
+> [carderne/pi-nvim](https://github.com/carderne/pi-nvim). Compared to the upstream npm
+> release it forwards prompt options and images, hardens the socket bridge (stale-manifest
+> pruning, `0700` sockets directory, `0600` sockets) and accepts arguments on `:Pi`/`:PiSend`.
+> The Neovim half is unchanged; only the pi extension name differs.
+
 ![demo](./demo/demo.gif)
 
 ## How it works
@@ -20,14 +26,14 @@ On Windows, unix sockets don't exist, so the extension binds a named pipe (`\\.\
 ### Pi side
 
 ```bash
-pi install npm:pi-nvim
+pi install npm:@sergioia-dev/pi-nvim
 ```
 
 Or add to `~/.pi/agent/settings.json`:
 
 ```json
 {
-  "packages": ["https://github.com/carderne/pi-nvim"]
+  "packages": ["https://github.com/sergioia-dev/pi-nvim"]
 }
 ```
 
@@ -38,7 +44,7 @@ Then `/reload` in pi.
 With [lazy.nvim](https://github.com/folke/lazy.nvim):
 
 ```lua
-{ "carderne/pi-nvim" }
+{ "sergioia-dev/pi-nvim" }
 ```
 
 Then in your config:
