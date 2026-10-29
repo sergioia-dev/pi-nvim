@@ -461,10 +461,8 @@ local function send_prompt_socket(message, expand_prompt_templates)
       return
     end
     if err then return end
-    if resp and resp.ok then
-      vim.notify("Sent to pi", vim.log.levels.INFO)
-    else
-      vim.notify("pi error: " .. (resp and resp.error or "unknown"), vim.log.levels.ERROR)
+    if resp and not resp.ok then
+      vim.notify("pi error: " .. (resp.error or "unknown"), vim.log.levels.ERROR)
     end
   end)
 end
