@@ -469,9 +469,21 @@ local function send_prompt_socket(message, expand_prompt_templates)
   end)
 end
 
+---Report the outcome of a dispatch to the user.
+---@param kind string classify_input() result
+---@param context_dropped boolean|nil attached context was left out
+local function notify_sent(kind, context_dropped)
+  local text = (kind == "prompt") and "Pi: Prompt sent" or "Pi: Command executed"
+  if kind ~= "prompt" and context_dropped then
+    text = text .. " (context not sent)"
+  end
+  vim.notify(text, vim.log.levels.INFO)
+end
+
 --- Send a prompt string to pi.
 --- @param message string|nil  If nil, prompts the user for input
-function M.prompt(message)
+--- @param opts table|nil  context_dropped: attached context was not sent
+function M.prompt(message, opts)
   if not message then
     vim.ui.input({ prompt = "Pi prompt: " }, function(input)
       if input and input ~= "" then
@@ -485,11 +497,7 @@ function M.prompt(message)
   local term_buf = find_pi_terminal()
 
   if term_buf and send_to_terminal(term_buf, message) then
-    if kind == "prompt" then
-      vim.notify("Sent to pi terminal buffer", vim.log.levels.INFO)
-    else
-      vim.notify(string.format("Sent %s to pi terminal", trim(message):match("^(%S+)")), vim.log.levels.INFO)
-    end
+    notify_sent(kind, opts and opts.context_dropped)
     return
   end
 
@@ -507,6 +515,7 @@ function M.prompt(message)
   end
 
   send_prompt_socket(message, kind == "expandable")
+  notify_sent(kind, opts and opts.context_dropped)
 end
 
 --- Send the current file path with optional prompt.

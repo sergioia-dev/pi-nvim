@@ -197,11 +197,9 @@ function M.open(opts)
     end
 
     local attached = selection ~= nil or file ~= "" or (send_buffer and rel_file ~= "")
-    if attached and prompt_text ~= "" and pi.classify_input(prompt_text) ~= "prompt" then
-      vim.notify("pi command sent without the attached context", vim.log.levels.INFO)
-    end
-
-    pi.prompt(message)
+    pi.prompt(message, {
+      context_dropped = attached and pi.classify_input(prompt_text) ~= "prompt",
+    })
   end
 
   local kopts = { buffer = input_buf, noremap = true, silent = true }

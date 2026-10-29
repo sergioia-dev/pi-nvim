@@ -55,6 +55,7 @@ eq("a builtin is not sent over the socket", #sent, 0)
 check("a builtin warns instead", last_notice():find("built%-in") ~= nil, last_notice())
 check("the warning names the command", last_notice():find("/settings", 1, true) ~= nil, last_notice())
 eq("the warning is a warning", notices.level, vim.log.levels.WARN)
+check("a refused builtin does not claim execution", last_notice():find("Command executed", 1, true) == nil, last_notice())
 
 -- 2. User bash mode is TUI-only too.
 reset()
@@ -69,6 +70,7 @@ eq("one message is sent", #sent, 1)
 eq("the message is a prompt", sent[1] and sent[1].type, "prompt")
 eq("the message text is unchanged", sent[1] and sent[1].message, "/skill:graphify")
 eq("expansion is requested", sent[1] and sent[1].expandPromptTemplates, true)
+eq("an expandable command reports execution", last_notice(), "Pi: Command executed")
 
 -- 4. Plain text keeps the old wire format (no expansion flag).
 reset()
@@ -76,12 +78,28 @@ pi.prompt("hello there")
 eq("one message is sent", #sent, 1)
 eq("the message text is unchanged", sent[1] and sent[1].message, "hello there")
 eq("no expansion flag for plain text", sent[1] and sent[1].expandPromptTemplates, nil)
+eq("plain text reports a sent prompt", last_notice(), "Pi: Prompt sent")
 
 -- 5. Paths that merely start with a slash stay prompts.
 reset()
 pi.prompt("/etc/hosts")
 eq("a path is sent as a prompt", #sent, 1)
 eq("a path is not flagged for expansion", sent[1] and sent[1].expandPromptTemplates, nil)
+eq("a path still reports a sent prompt", last_notice(), "Pi: Prompt sent")
+
+-- 7. A command whose attached context had to be dropped says so, once.
+reset()
+pi.prompt("/plan start", { context_dropped = true })
+eq("the command still goes over the socket", sent[1] and sent[1].message, "/plan start")
+eq("the notice reports the drop", last_notice(), "Pi: Command executed (context not sent)")
+
+-- 8. Asking for input notifies nothing.
+reset()
+local original_input = vim.ui.input
+vim.ui.input = function() end
+pi.prompt(nil)
+vim.ui.input = original_input
+eq("an empty prompt notifies nothing", last_notice(), "")
 
 -- 6. With a pi terminal loaded, everything is typed into it and never sent
 --    over the socket (that is what keeps built-ins working).
@@ -96,7 +114,7 @@ else
 	reset()
 	pi.prompt("/settings")
 	eq("a builtin does not go over the socket when a terminal exists", #sent, 0)
-	check("a builtin is reported as sent to the terminal", last_notice():find("terminal") ~= nil, last_notice())
+	eq("a builtin typed into the terminal reports execution", last_notice(), "Pi: Command executed")
 
 	local function wait_for_text(needle)
 		return vim.wait(3000, function()
@@ -114,6 +132,7 @@ else
 	pi.prompt("written-to-terminal")
 	eq("a prompt does not go over the socket when a terminal exists", #sent, 0)
 	check("the prompt reached the terminal", wait_for_text("written-to-terminal"))
+	eq("a prompt typed into the terminal reports a sent prompt", last_notice(), "Pi: Prompt sent")
 
 	vim.fn.jobstop(job)
 end

@@ -101,6 +101,12 @@ eq("a bare prompt is unchanged", ui.build_message({ prompt_text = "hello  world"
 local whole = ui.build_message({ send_buffer = true, rel_file = "src/app.ts", buf_lines = {}, ft = "typescript" })
 check("a buffer with no prompt still sends the buffer", whole:find("Look at this file src/app.ts", 1, true) ~= nil, whole)
 
+-- 12. The dropped-context notice belongs to pi.prompt now, not to this file.
+local ui_source = vim.api.nvim_get_runtime_file("lua/pi-nvim/ui.lua", false)[1]
+local ui_text = table.concat(vim.fn.readfile(ui_source), "\n")
+check("ui.lua no longer notifies about dropped context", not ui_text:find("pi command sent without the attached context", 1, true))
+check("ui.lua hands the drop to pi.prompt", ui_text:find("context_dropped", 1, true) ~= nil)
+
 if failures > 0 then
 	io.write(string.format("%d checks, %d failures\n", checks, failures))
 	vim.cmd("cquit 1")
