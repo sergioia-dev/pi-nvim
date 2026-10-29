@@ -26,7 +26,7 @@ run_spec() {
 }
 
 status=0
-for spec in classify_spec sessions_spec prompt_spec commands_spec; do
+for spec in classify_spec sessions_spec prompt_spec commands_spec ui_spec; do
 	if ! run_spec "$spec"; then
 		status=1
 	fi

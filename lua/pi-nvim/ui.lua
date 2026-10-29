@@ -182,33 +182,18 @@ function M.open(opts)
     local prompt_text = vim.fn.trim(table.concat(lines, "\n"))
     close()
 
-    local message
-    if selection then
-      local header = string.format("%s lines %d-%d", selection.file, selection.start_line, selection.end_line)
-      if prompt_text == "" then
-        message = string.format("Look at this code from %s:\n\n```%s\n%s\n```", header, selection.ft, selection.text)
-      else
-        message = string.format("%s\n\nFrom %s:\n```%s\n%s\n```", prompt_text, header, selection.ft, selection.text)
-      end
-    elseif send_buffer and rel_file ~= "" then
-      local content = table.concat(buf_lines, "\n")
-      if prompt_text == "" then
-        message = string.format("Look at this file %s:\n\n```%s\n%s\n```", rel_file, ft, content)
-      else
-        message = string.format("%s\n\nFile: %s\n```%s\n%s\n```", prompt_text, rel_file, ft, content)
-      end
-    elseif file ~= "" then
-      if prompt_text == "" then
-        message = string.format("Look at this file: %s", file)
-      else
-        message = string.format("File: %s\n\n%s", file, prompt_text)
-      end
-    else
-      if prompt_text == "" then
-        vim.notify("Nothing to send", vim.log.levels.WARN)
-        return
-      end
-      message = prompt_text
+    local message = M.build_message({
+      prompt_text = prompt_text,
+      selection = selection,
+      send_buffer = send_buffer,
+      file = file,
+      rel_file = rel_file,
+      buf_lines = buf_lines,
+      ft = ft,
+    })
+    if not message then
+      vim.notify("Nothing to send", vim.log.levels.WARN)
+      return
     end
 
     pi.prompt(message)
@@ -241,4 +226,64 @@ function M.open(opts)
   })
 end
 
+---Build the text handed to pi for the current dialog state.
+---
+---A pi command only runs when it starts the message: pi checks
+---`text.startsWith("/")` before dispatching. So when the user typed a
+---command, it has to come before any file or selection context; otherwise
+---pi runs the whole thing as prose. Plain prompts keep context first, which
+---reads better for the model.
+---
+---Returns nil when there is nothing to send.
+---@param opts table prompt_text, selection, send_buffer, file, rel_file, buf_lines, ft
+---@return string|nil
+function M.build_message(opts)
+  local pi = require("pi-nvim")
+  local prompt_text = opts.prompt_text or ""
+  local selection = opts.selection
+  local send_buffer = opts.send_buffer
+  local file = opts.file or ""
+  local rel_file = opts.rel_file or ""
+  local buf_lines = opts.buf_lines or {}
+  local ft = opts.ft or "text"
+  local is_command = prompt_text ~= "" and pi.classify_input(prompt_text) ~= "prompt"
+
+  if selection then
+    local header = string.format("%s lines %d-%d", selection.file, selection.start_line, selection.end_line)
+    local body = string.format("```%s\n%s\n```", selection.ft, selection.text)
+    if prompt_text == "" then
+      return string.format("Look at this code from %s:\n\n%s", header, body)
+    end
+    if is_command then
+      return string.format("%s\n\nFrom %s:\n%s", prompt_text, header, body)
+    end
+    return string.format("From %s:\n%s\n\n%s", header, body, prompt_text)
+  end
+
+  if send_buffer and rel_file ~= "" then
+    local body = string.format("```%s\n%s\n```", ft, table.concat(buf_lines, "\n"))
+    if prompt_text == "" then
+      return string.format("Look at this file %s:\n\n%s", rel_file, body)
+    end
+    if is_command then
+      return string.format("%s\n\nFile: %s\n%s", prompt_text, rel_file, body)
+    end
+    return string.format("File: %s\n%s\n\n%s", rel_file, body, prompt_text)
+  end
+
+  if file ~= "" then
+    if prompt_text == "" then
+      return string.format("Look at this file: %s", file)
+    end
+    if is_command then
+      return string.format("%s\n\nFile: %s", prompt_text, file)
+    end
+    return string.format("File: %s\n\n%s", file, prompt_text)
+  end
+
+  if prompt_text == "" then
+    return nil
+  end
+  return prompt_text
+end
 return M
