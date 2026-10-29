@@ -5,6 +5,11 @@
 --- Regression guard for the report "I ran /plan start and it was executed as a
 --- prompt": the file branch used to put `File: <path>` first, so the command
 --- never reached byte 0 and `expandPromptTemplates` was never set.
+---
+--- A command also cannot carry context: pi parses `/<name> <args>` and hands
+--- everything after the command name to the handler as arguments, so a message
+--- like "/plan start\n\nFile: <path>" turned the plan prompt into
+--- "start\n\nFile: <path>". Commands therefore go out bare.
 local ui = require("pi-nvim.ui")
 
 local failures = 0
@@ -37,9 +42,9 @@ local file = "/home/sia/Work/src/app.ts"
 
 -- 1. The reported regression: a slash command with file context attached.
 local msg = ui.build_message({ prompt_text = "/plan start", file = file })
-check("a command with a file keeps the command first", msg:sub(1, 11) == "/plan start", msg)
-check("the file context survives", msg:find("File: " .. file, 1, true) ~= nil, msg)
-eq("nothing is prepended", first_mismatch(msg, "/plan start\n\nFile: " .. file), 0)
+eq("a command with a file is sent bare", msg, "/plan start")
+eq("nothing is prepended", first_mismatch(msg, "/plan start"), 0)
+check("no file context rides along as command args", msg:find("File: ", 1, true) == nil, msg)
 
 -- 2. Plain prose keeps the context-first layout that reads naturally.
 eq(
@@ -56,20 +61,21 @@ eq(
 )
 
 -- 4. TUI-only built-ins are commands too; pi-nvim.prompt does the warning.
-local builtin = ui.build_message({ prompt_text = "/settings", file = file })
-check("a builtin also stays first", builtin:sub(1, 9) == "/settings", builtin)
+eq("a builtin is sent bare", ui.build_message({ prompt_text = "/settings", file = file }), "/settings")
 
 -- 5. A terminal buffer is just another file.
-local term = ui.build_message({ prompt_text = "/plan start", file = "term://~/Work//123:/bin/bash" })
-check("a terminal buffer keeps the command first", term:sub(1, 11) == "/plan start", term)
+eq(
+	"a terminal buffer is not appended to the command",
+	ui.build_message({ prompt_text = "/plan start", file = "term://~/Work//123:/bin/bash" }),
+	"/plan start"
+)
 
--- 6. A selection carries its own context, command first as well.
+-- 6. A selection carries its own context, which a command cannot take either.
 local sel = ui.build_message({
 	prompt_text = "/plan start",
 	selection = { file = "src/app.ts", start_line = 3, end_line = 9, text = "x = 1", ft = "typescript" },
 })
-check("a selection keeps the command first", sel:sub(1, 11) == "/plan start", sel)
-check("the selection is included", sel:find("src/app.ts lines 3-9", 1, true) ~= nil, sel)
+eq("a selection is dropped for a command", sel, "/plan start")
 
 -- 7. A whole buffer works the same way.
 local buf = ui.build_message({
@@ -79,7 +85,7 @@ local buf = ui.build_message({
 	buf_lines = { "line one" },
 	ft = "typescript",
 })
-check("a whole buffer keeps the command first", buf:sub(1, 11) == "/plan start", buf)
+eq("a whole buffer is dropped for a command", buf, "/plan start")
 
 -- 8. No prompt at all still means "look at this".
 eq("an empty prompt names the file", ui.build_message({ file = file }), "Look at this file: " .. file)

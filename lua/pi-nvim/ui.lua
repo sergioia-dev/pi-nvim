@@ -196,6 +196,11 @@ function M.open(opts)
       return
     end
 
+    local attached = selection ~= nil or file ~= "" or (send_buffer and rel_file ~= "")
+    if attached and prompt_text ~= "" and pi.classify_input(prompt_text) ~= "prompt" then
+      vim.notify("pi command sent without the attached context", vim.log.levels.INFO)
+    end
+
     pi.prompt(message)
   end
 
@@ -255,7 +260,7 @@ function M.build_message(opts)
       return string.format("Look at this code from %s:\n\n%s", header, body)
     end
     if is_command then
-      return string.format("%s\n\nFrom %s:\n%s", prompt_text, header, body)
+      return prompt_text
     end
     return string.format("From %s:\n%s\n\n%s", header, body, prompt_text)
   end
@@ -266,7 +271,7 @@ function M.build_message(opts)
       return string.format("Look at this file %s:\n\n%s", rel_file, body)
     end
     if is_command then
-      return string.format("%s\n\nFile: %s\n%s", prompt_text, rel_file, body)
+      return prompt_text
     end
     return string.format("File: %s\n%s\n\n%s", rel_file, body, prompt_text)
   end
@@ -276,7 +281,7 @@ function M.build_message(opts)
       return string.format("Look at this file: %s", file)
     end
     if is_command then
-      return string.format("%s\n\nFile: %s", prompt_text, file)
+      return prompt_text
     end
     return string.format("File: %s\n\n%s", file, prompt_text)
   end
